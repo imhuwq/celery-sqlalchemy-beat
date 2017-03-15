@@ -1,0 +1,11 @@
+alembic==0.9.1
+amqp==2.1.4
+billiard==3.5.0.2
+celery==4.0.2
+kombu==4.0.2
+Mako==1.0.6
+MarkupSafe==1.0
+python-editor==1.0.3
+pytz==2016.10
+SQLAlchemy==1.1.6
+vine==1.1.3
