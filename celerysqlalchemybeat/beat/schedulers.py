@@ -1,12 +1,13 @@
-import traceback
+import time
 import datetime
+import traceback
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import scoped_session, sessionmaker
 
-from celery.beat import Scheduler, ScheduleEntry
-from celery.utils.log import get_logger
 from celery import current_app
+from celery.utils.log import get_logger
+from celery.beat import Scheduler, ScheduleEntry, event_t, heapq
 
 from celerysqlalchemybeat.beat.model import PeriodicTask
 
@@ -50,8 +51,6 @@ class SAScheduleEntry(ScheduleEntry):
     __next__ = next
 
     def is_due(self):
-        if not self._task.enabled:
-            return False, 5.0  # 5 second delay for re-enable.
         if hasattr(self._task, 'start_after') and self._task.start_after:
             if datetime.datetime.now() < self._task.start_after:
                 return False, 5.0
@@ -69,21 +68,6 @@ class SAScheduleEntry(ScheduleEntry):
             self.name, self.task, self.args,
             self.kwargs, self.schedule,
         ))
-
-    def reserve(self, entry):
-        new_entry = Scheduler.reserve(self, entry)
-        return new_entry
-
-    def save(self, db_session):
-        if self.total_run_count > self._task.total_run_count:
-            self._task.total_run_count = self.total_run_count
-        if self.last_run_at and self._task.last_run_at and self.last_run_at > self._task.last_run_at:
-            self._task.last_run_at = self.last_run_at
-        self._task.run_immediately = False
-        try:
-            db_session.commit()
-        except Exception:
-            get_logger(__name__).error(traceback.format_exc())
 
 
 class SAScheduler(Scheduler):
@@ -108,6 +92,20 @@ class SAScheduler(Scheduler):
         self.max_interval = (kwargs.get('max_interval')
                              or self.app.conf.CELERYBEAT_MAX_LOOP_INTERVAL or 5)
 
+    def tick(self, event_t=event_t, min=min,
+             heappop=heapq.heappop, heappush=heapq.heappush,
+             heapify=heapq.heapify, mktime=time.mktime):
+
+        adjust = self.adjust
+        interval = self.max_interval
+
+        for entry in self.schedule.values():
+            is_due, next_time_to_run = self.is_due(entry)
+            if is_due:
+                self.apply_entry(entry, producer=self.producer)
+            interval = min(adjust(next_time_to_run), interval)
+        return interval
+
     def setup_schedule(self):
         pass
 
@@ -118,15 +116,15 @@ class SAScheduler(Scheduler):
 
     @property
     def objects(self):
-        objs = self.query(self.Model).all()
+        objs = self.query(self.Model).filter_by(enabled=True).all()
         return objs
 
     def get_from_database(self):
         self.sync()
-        d = {}
+        records = {}
         for obj in self.objects:
-            d[obj.name] = self.Entry(obj)
-        return d
+            records[obj.name] = self.Entry(obj)
+        return records
 
     @property
     def schedule(self):
@@ -137,4 +135,12 @@ class SAScheduler(Scheduler):
 
     def sync(self):
         for entry in self._schedule.values():
-            entry.save(self.session)
+            try:
+                if entry.total_run_count > entry._task.total_run_count:
+                    entry._task.total_run_count = entry.total_run_count
+                if entry.last_run_at and entry._task.last_run_at and entry.last_run_at > entry._task.last_run_at:
+                    entry._task.last_run_at = entry.last_run_at
+                entry._task.run_immediately = False
+                self.session.commit()
+            except Exception:
+                get_logger(__name__).error(traceback.format_exc())
